@@ -326,7 +326,9 @@ div[data-testid="stSelectbox"] > div > div {
 .stPlotlyChart { border-radius: 8px; overflow: hidden; }
 
 /* Hide streamlit chrome */
-#MainMenu, footer, header { visibility: hidden; }
+#MainMenu, footer { visibility: hidden; }
+header { visibility: visible; }
+[data-testid="collapsedControl"] { visibility: visible; }
 </style>
 """, unsafe_allow_html=True)
 
