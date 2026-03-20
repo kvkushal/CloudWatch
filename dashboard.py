@@ -1,4 +1,3 @@
-import os
 import streamlit as st
 import requests
 import pandas as pd
@@ -8,15 +7,8 @@ import json
 from datetime import datetime
 
 # ================= CONFIG =================
-# DEMO_MODE: True when deployed to Streamlit Community Cloud (no backend).
-# Set env var DEMO_MODE=false in your local .env or shell to use live API.
-DEMO_MODE = os.environ.get("DEMO_MODE", "true").lower() == "true"
-
-API_BASE  = "http://localhost:5000/api"
-ACCOUNTS  = ['acct-001', 'acct-002', 'acct-003', 'acct-004', 'acct-005']
-
-if DEMO_MODE:
-    import demo_data
+API_BASE = "http://localhost:5000/api"
+ACCOUNTS = ['acct-001', 'acct-002', 'acct-003', 'acct-004', 'acct-005']
 
 st.set_page_config(
     page_title="CloudWatch - Cost Intelligence",
@@ -37,7 +29,7 @@ html, body, .stApp {
     font-family: 'Syne', sans-serif;
 }
 
-.block-container { padding: 1.5rem 2rem 3rem 2rem; max-width: 100%; }
+.block-container { padding: 3.5rem 2rem 3rem 2rem; max-width: 100%; }
 
 /* ---- Sidebar ---- */
 section[data-testid="stSidebar"] {
@@ -76,6 +68,7 @@ section[data-testid="stSidebar"] .block-container { padding: 2rem 1.2rem; }
     align-items: flex-end;
     justify-content: space-between;
     margin-bottom: 2rem;
+    margin-top: 0.5rem;
     padding-bottom: 1.5rem;
     border-bottom: 1px solid #1A2236;
 }
@@ -326,9 +319,7 @@ div[data-testid="stSelectbox"] > div > div {
 .stPlotlyChart { border-radius: 8px; overflow: hidden; }
 
 /* Hide streamlit chrome */
-#MainMenu, footer { visibility: hidden; }
-header { visibility: visible; }
-[data-testid="collapsedControl"] { visibility: visible; }
+#MainMenu, footer, header { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -391,24 +382,13 @@ CHART_LAYOUT = dict(
 ACCENT_COLORS = ["#4F8EF7", "#22D3A0", "#F59E0B", "#EF4444", "#A78BFA", "#FB923C"]
 
 # ================= DATA FETCH =================
-_acct = st.session_state.get('account', ACCOUNTS[0])
-
-if DEMO_MODE:
-    dashboard   = demo_data.get_dashboard(_acct)
-    trend       = demo_data.get_trend(_acct)
-    recs        = demo_data.get_recommendations(_acct)
-    alerts_resp = demo_data.get_alerts(_acct)
-    anomaly     = demo_data.get_anomaly_stats(_acct)
-    costs_resp  = demo_data.get_costs(_acct)
-    region_data = demo_data.get_region_data()
-else:
-    dashboard   = safe_fetch(f"/dashboard/{_acct}",        {"data": {}})
-    trend       = safe_fetch(f"/trend/{_acct}",            {"data": []})
-    recs        = safe_fetch(f"/recommendations/{_acct}",  {"data": [], "by_type": {}, "total_monthly_savings": 0})
-    alerts_resp = safe_fetch(f"/alerts/{_acct}",           {"data": []})
-    anomaly     = safe_fetch(f"/anomaly-stats/{_acct}",    {"data": {}})
-    costs_resp  = safe_fetch(f"/costs/{_acct}",            {"data": []})
-    region_data = safe_fetch("/usage/by-region/ap-south-1",{"service_cost_summary": {}})
+dashboard   = safe_fetch(f"/dashboard/{st.session_state.get('account', ACCOUNTS[0])}", {"data": {}})
+trend       = safe_fetch(f"/trend/{st.session_state.get('account', ACCOUNTS[0])}", {"data": []})
+recs        = safe_fetch(f"/recommendations/{st.session_state.get('account', ACCOUNTS[0])}", {"data": [], "by_type": {}, "total_monthly_savings": 0})
+alerts_resp = safe_fetch(f"/alerts/{st.session_state.get('account', ACCOUNTS[0])}", {"data": []})
+anomaly     = safe_fetch(f"/anomaly-stats/{st.session_state.get('account', ACCOUNTS[0])}", {"data": {}})
+costs_resp  = safe_fetch(f"/costs/{st.session_state.get('account', ACCOUNTS[0])}", {"data": []})
+region_data = safe_fetch("/usage/by-region/ap-south-1", {"service_cost_summary": {}})
 
 data        = dashboard.get("data", {})
 total_spend = float(data.get("total_spend", 0) or 0)
@@ -421,21 +401,6 @@ anomaly_stats = anomaly.get("data", {})
 # ================= SIDEBAR =================
 with st.sidebar:
     st.markdown('<div class="sidebar-logo">Cloud<span>Watch</span></div>', unsafe_allow_html=True)
-
-    if DEMO_MODE:
-        st.markdown("""
-        <div style="background:rgba(79,142,247,0.08);border:1px solid rgba(79,142,247,0.25);
-                    border-radius:7px;padding:10px 12px;margin-bottom:16px;">
-            <div style="font-size:10px;font-weight:700;letter-spacing:0.12em;
-                        color:#4F8EF7;text-transform:uppercase;margin-bottom:4px">Demo Mode</div>
-            <div style="font-size:11px;color:#6B7A99;line-height:1.5">
-                Showing realistic static data.<br>
-                <a href="https://github.com/kvkushal/CloudWatch"
-                   target="_blank"
-                   style="color:#4F8EF7;text-decoration:none">View source on GitHub</a>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
     st.markdown('<div class="sidebar-label">Account</div>', unsafe_allow_html=True)
     selected_account = st.selectbox("Account", ACCOUNTS, label_visibility="collapsed", key="account")
     st.markdown('<div class="sidebar-label">Actions</div>', unsafe_allow_html=True)
@@ -595,8 +560,7 @@ with col1:
             hovertemplate="<b>%{x|%b %d}</b><br>$%{y:,.2f}<extra></extra>",
         ))
 
-        _exclude = {"legend", "xaxis", "yaxis"}
-        trend_layout = {k: v for k, v in CHART_LAYOUT.items() if k not in _exclude}
+        trend_layout = {k: v for k, v in CHART_LAYOUT.items() if k != "legend"}
         fig.update_layout(
             **trend_layout,
             height=260,
@@ -785,9 +749,8 @@ with col2:
             textfont=dict(family="JetBrains Mono, monospace", size=11, color="#6B7A99"),
             hovertemplate="<b>%{x}</b><br>%{y} recommendation(s)<extra></extra>",
         ))
-        _rec_layout = {k: v for k, v in CHART_LAYOUT.items() if k != "yaxis"}
         fig.update_layout(
-            **_rec_layout,
+            **CHART_LAYOUT,
             height=220,
             yaxis=dict(**{k: v for k, v in CHART_LAYOUT["yaxis"].items() if k != "tickprefix"},
                        tickprefix=""),
