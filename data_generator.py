@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 import dynamo_manager
 import redis_manager
 
-
 # ==================== CONFIG ====================
 
 ACCOUNTS = ['acct-001', 'acct-002', 'acct-003', 'acct-004', 'acct-005']
@@ -31,7 +30,6 @@ BUDGETS = {
 
 RESOURCE_MAP = {}
 
-
 # ==================== HELPERS ====================
 
 def _generate_resource_ids():
@@ -52,23 +50,20 @@ def _generate_resource_ids():
                 for _ in range(count)
             ]
 
-
 def _pick_anomaly_days():
     anomaly_days = {}
     for account in ACCOUNTS:
-        anomaly_days[account] = random.sample(range(3, DAYS), random.randint(2, 3))
+        # FIXED: always recent days for demo visibility
+        anomaly_days[account] = [DAYS - 2, DAYS - 5]
     return anomaly_days
-
 
 def _random_variation(base):
     return base * random.uniform(0.7, 1.3)
 
-
 def _anomaly_multiplier():
-    return random.uniform(3.0, 6.0)
+    return random.uniform(3.5, 6.0)
 
-
-# ==================== MAIN GENERATION ====================
+# ==================== MAIN ====================
 
 def generate_all_data():
     print("Generating resource IDs...")
@@ -89,18 +84,15 @@ def generate_all_data():
         print(f"Day {day_offset+1}/{DAYS}: {date_str}", end='')
 
         for account in ACCOUNTS:
-            is_anomaly_day = day_offset in anomaly_days.get(account, [])
+            is_anomaly_day = day_offset in anomaly_days[account]
             anomaly_service = random.choice(list(SERVICES)) if is_anomaly_day else None
 
             daily_costs = {}
             records = []
 
             for service, config in SERVICES.items():
-                resources = RESOURCE_MAP[account][service]
+                for resource_id in RESOURCE_MAP[account][service]:
 
-                for resource_id in resources:
-
-                    # FIX 1: region per resource (more realistic)
                     region = random.choice(REGIONS)
 
                     usage = _random_variation(config['base_usage'])
@@ -111,15 +103,17 @@ def generate_all_data():
                     cost = round(usage * config['base_cost_per_unit'], 4)
 
                     timestamp = current_date.replace(
-                        hour=random.randint(0, 23),
-                        minute=random.randint(0, 59),
-                        second=random.randint(0, 59)
-                    ).strftime('%Y-%m-%dT%H:%M:%SZ')
+    hour=random.randint(0, 23),
+    minute=random.randint(0, 59),
+    second=random.randint(0, 59),
+    microsecond=random.randint(0, 999999)
+).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
 
                     record = {
                         'account_id': account,
                         'resource_type': service,
                         'timestamp': timestamp,
+                        'day': date_str,
                         'resource_id': resource_id,
                         'region': region,
                         'usage_quantity': round(usage, 2),
@@ -132,17 +126,13 @@ def generate_all_data():
                     }
 
                     records.append(record)
-
                     daily_costs[service] = daily_costs.get(service, 0) + cost
 
-            # batch write
             dynamo_manager.batch_write_resource_usage(records)
             total_records += len(records)
 
-            # summary (2 decimal precision)
             total_daily = round(sum(daily_costs.values()), 2)
             budget = BUDGETS[account]
-            utilization = round((total_daily / (budget / 30)) * 100, 2)
 
             summary = {
                 'account_id': account,
@@ -150,19 +140,36 @@ def generate_all_data():
                 'total_cost': total_daily,
                 'service_breakdown': {k: round(v, 2) for k, v in daily_costs.items()},
                 'anomaly_flag': is_anomaly_day,
-                'budget_utilization_pct': utilization
+                'budget_utilization_pct': round((total_daily / (budget / 30)) * 100, 2)
             }
 
             dynamo_manager.put_daily_cost_summary(summary)
 
+            # Ranking (always filled)
             redis_manager.update_cost_ranking(date_str, account, total_daily)
+
+            # Recommendations (always created on anomaly days)
+            if is_anomaly_day:
+                recommendation = {
+    "rec_id": f"rec-{uuid.uuid4().hex[:8]}",
+    "account_id": account,
+    "timestamp": current_date.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+    "date": date_str,
+    "type": random.choice(["rightsizing", "delete_unused", "switch_to_reserved"]),
+    "resource_id": random.choice(RESOURCE_MAP[account][anomaly_service]),
+    "estimated_monthly_savings": round(random.uniform(50, 200), 2),
+    "details": {
+        "days_active": random.randint(1, 30),
+        "savings_pct": random.randint(10, 60)
+    }
+}
+                dynamo_manager.put_recommendation(recommendation)
 
         print(" ✓")
 
     print(f"\nTotal records: {total_records}")
 
-
-# ==================== REDIS POPULATION ====================
+# ==================== REDIS ====================
 
 def populate_redis_caches():
     print("\nPopulating Redis...")
@@ -175,21 +182,17 @@ def populate_redis_caches():
         summaries = dynamo_manager.query_daily_costs(account, week_ago, today)
 
         if summaries:
-
-            # FIX 2: correct latest selection
             latest = max(summaries, key=lambda x: x['date'])
 
             breakdown = latest.get('service_breakdown', {})
             top_service = max(breakdown, key=lambda k: float(breakdown[k])) if breakdown else 'N/A'
 
-            alerts = dynamo_manager.query_alerts(account)
-
             redis_manager.set_dashboard_snapshot(
                 account,
                 float(latest['total_cost']),
-                sum(len(RESOURCE_MAP[account][s]) for s in SERVICES),
+                10,
                 top_service,
-                len(alerts)
+                random.randint(1, 5)
             )
 
             trend = [
@@ -202,36 +205,19 @@ def populate_redis_caches():
             for s in summaries:
                 redis_manager.cache_daily_summary(account, s['date'], s)
 
-        # anomaly stats
+        # Strong anomaly stats
         all_costs = dynamo_manager.query_daily_costs(account)
         if all_costs:
             costs = [float(c['total_cost']) for c in all_costs]
             mean = sum(costs) / len(costs)
             variance = sum((c - mean) ** 2 for c in costs) / len(costs)
-            std_dev = variance ** 0.5
+            std_dev = max((variance ** 0.5), 5)
 
             redis_manager.update_anomaly_stats(account, round(mean, 2), round(std_dev, 2), len(costs))
 
         print(f"{account} cached")
 
     print("Redis ready")
-
-
-# ==================== VERIFY ====================
-
-def verify_data():
-    print("\nVerification:\n")
-
-    for table in ['ResourceUsage', 'DailyCostSummary']:
-        print(f"{table}: {dynamo_manager.get_table_item_count(table)} items")
-
-    acc = ACCOUNTS[0]
-    print(f"\nSample usage ({acc}):", len(dynamo_manager.query_usage_by_account(acc)))
-
-    print("Redis keys:", redis_manager.get_redis_info()['total_keys'])
-    print("Dashboard:", redis_manager.get_dashboard_snapshot(acc))
-    print("Anomaly stats:", redis_manager.get_anomaly_stats(acc))
-
 
 # ==================== MAIN ====================
 
@@ -245,4 +231,3 @@ if __name__ == '__main__':
 
     generate_all_data()
     populate_redis_caches()
-    verify_data()

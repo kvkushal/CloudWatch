@@ -388,6 +388,26 @@ def get_summary():
 
     return jsonify({'source': 'redis+dynamodb', 'data': account_summaries})
 
+#new
+@app.route('/api/insights/<account_id>', methods=['GET'])
+def get_insights(account_id):
+    summaries = dynamo_manager.query_daily_costs(account_id)
+    
+    if not summaries:
+        return jsonify({'error': 'No data'}), 404
+
+    total = sum(float(s['total_cost']) for s in summaries)
+    avg   = total / len(summaries)
+
+    max_day = max(summaries, key=lambda x: float(x['total_cost']))
+
+    return jsonify({
+        'account_id': account_id,
+        'total_spend': round(total, 2),
+        'average_daily_cost': round(avg, 2),
+        'highest_spend_day': max_day
+    })
+
 
 # ==================== MAIN ====================
 

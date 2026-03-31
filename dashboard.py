@@ -975,3 +975,148 @@ else:
     st.markdown('<div style="color:#4A5568;font-size:12px;padding:40px 0;text-align:center;">No regional data available for ap-south-1</div>', unsafe_allow_html=True)
 
 st.markdown('</div>', unsafe_allow_html=True)
+
+st.markdown('<div class="panel">', unsafe_allow_html=True)
+st.markdown("""
+<div class="section-header">
+    <div class="section-title">Query Explorer</div>
+    <div class="section-badge">Live API Queries</div>
+</div>
+""", unsafe_allow_html=True)
+
+query_type = st.selectbox(
+    "Select Query",
+    [
+        "Cost by Date Range",
+        "Usage by Service",
+        "Usage by Region",
+        "Top Accounts (Ranking)",
+        "Anomaly Stats",
+        "Recommendations"
+    ]
+)
+
+# ---- Helper to show table ----
+def show_table(result):
+    if "data" not in result or not result["data"]:
+        return
+
+    data = result["data"]
+
+    # Case 1: list of records (most queries)
+    if isinstance(data, list):
+        df = pd.DataFrame(data)
+
+    # Case 2: single dict (anomaly, stats, etc.)
+    elif isinstance(data, dict):
+        df = pd.DataFrame([data])
+
+    else:
+        return
+
+    # Only select columns if they exist
+    cols = [c for c in ["account_id", "resource_type", "region", "cost_usd", "usage_quantity"] if c in df.columns]
+    if cols:
+        df = df[cols]
+
+    st.dataframe(df.head(10), use_container_width=True)
+
+
+# ---- Cost Query ----
+if query_type == "Cost by Date Range":
+    start = st.date_input("Start Date")
+    end   = st.date_input("End Date")
+
+    if st.button("Run Cost Query"):
+        result = safe_fetch(f"/costs/{selected_account}?start={start}&end={end}", {"error": "No data"})
+
+        if "error" in result:
+            st.markdown('<div class="section-badge">Source: unavailable</div>', unsafe_allow_html=True)
+            st.warning("No data returned")
+        else:
+            st.markdown(f'<div class="section-badge">Source: {result.get("source", "unknown")}</div>', unsafe_allow_html=True)
+            show_table(result)
+            st.json(result)
+
+
+# ---- Service Query ----
+elif query_type == "Usage by Service":
+    service = st.selectbox("Service", ["EC2", "S3", "Lambda", "RDS", "CloudFront"])
+
+    if st.button("Run Service Query"):
+        result = safe_fetch(f"/usage/by-service/{service}", {"error": "No data"})
+
+        if "error" in result:
+            st.markdown('<div class="section-badge">Source: unavailable</div>', unsafe_allow_html=True)
+            st.warning("No data returned")
+        else:
+            st.markdown(f'<div class="section-badge">Source: {result.get("source", "unknown")}</div>', unsafe_allow_html=True)
+            show_table(result)
+            st.json(result)
+
+
+# ---- Region Query ----
+elif query_type == "Usage by Region":
+    region = st.selectbox("Region", ["ap-south-1", "us-east-1", "eu-west-1"])
+
+    if st.button("Run Region Query"):
+        result = safe_fetch(f"/usage/by-region/{region}", {"error": "No data"})
+
+        if "error" in result:
+            st.markdown('<div class="section-badge">Source: unavailable</div>', unsafe_allow_html=True)
+            st.warning("No data returned")
+        else:
+            st.markdown(f'<div class="section-badge">Source: {result.get("source", "unknown")}</div>', unsafe_allow_html=True)
+            show_table(result)
+            st.json(result)
+
+
+# ---- Rankings ----
+elif query_type == "Top Accounts (Ranking)":
+    if st.button("Run Ranking Query"):
+        result = safe_fetch("/rankings", {"error": "No data"})
+
+        if "error" in result:
+            st.markdown('<div class="section-badge">Source: unavailable</div>', unsafe_allow_html=True)
+            st.warning("No data returned")
+        else:
+            st.markdown(f'<div class="section-badge">Source: {result.get("source", "unknown")}</div>', unsafe_allow_html=True)
+            show_table(result)
+            st.json(result)
+
+
+# ---- Anomaly ----
+elif query_type == "Anomaly Stats":
+    if st.button("Run Anomaly Query"):
+        result = safe_fetch(f"/anomaly-stats/{selected_account}", {"error": "No data"})
+
+        if "error" in result:
+            st.markdown('<div class="section-badge">Source: unavailable</div>', unsafe_allow_html=True)
+            st.warning("No data returned")
+        else:
+            st.markdown(f'<div class="section-badge">Source: {result.get("source", "unknown")}</div>', unsafe_allow_html=True)
+
+            # Handle anomaly data properly
+            if "data" in result and isinstance(result["data"], dict) and result["data"]:
+                st.subheader("Anomaly Summary")
+                st.json(result["data"])
+            else:
+                show_table(result)
+
+            st.json(result)
+
+
+# ---- Recommendations ----
+elif query_type == "Recommendations":
+    if st.button("Run Recommendation Query"):
+        result = safe_fetch(f"/recommendations/{selected_account}", {"error": "No data"})
+
+        if "error" in result:
+            st.markdown('<div class="section-badge">Source: unavailable</div>', unsafe_allow_html=True)
+            st.warning("No data returned")
+        else:
+            st.markdown(f'<div class="section-badge">Source: {result.get("source", "unknown")}</div>', unsafe_allow_html=True)
+            show_table(result)
+            st.json(result)
+
+st.markdown('</div>', unsafe_allow_html=True)
