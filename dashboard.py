@@ -717,7 +717,7 @@ with col1:
         rec_df = rec_df.sort_values("estimated_monthly_savings", ascending=False)
 
         for _, row in rec_df.head(10).iterrows():
-            rec_type    = str(row.get("type", "default")).lower().replace(" ", "_")
+            rec_type    = str(row.get("rec_type", row.get("type", "default"))).lower().replace(" ", "_")
             savings_val = row.get("estimated_monthly_savings", 0)
             details     = row.get("_details", {})
 

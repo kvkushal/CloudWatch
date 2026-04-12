@@ -150,19 +150,22 @@ def generate_all_data():
 
             # Recommendations (always created on anomaly days)
             if is_anomaly_day:
+                rec_id = f"rec-{uuid.uuid4().hex[:8]}"
+                rec_ts = current_date.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
                 recommendation = {
-    "rec_id": f"rec-{uuid.uuid4().hex[:8]}",
-    "account_id": account,
-    "timestamp": current_date.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
-    "date": date_str,
-    "type": random.choice(["rightsizing", "delete_unused", "switch_to_reserved"]),
-    "resource_id": random.choice(RESOURCE_MAP[account][anomaly_service]),
-    "estimated_monthly_savings": round(random.uniform(50, 200), 2),
-    "details": {
-        "days_active": random.randint(1, 30),
-        "savings_pct": random.randint(10, 60)
-    }
-}
+                    "rec_id": rec_id,
+                    "rec_id_timestamp": f"{rec_id}#{rec_ts}",
+                    "account_id": account,
+                    "timestamp": rec_ts,
+                    "date": date_str,
+                    "rec_type": random.choice(["rightsizing", "delete_unused", "switch_to_reserved"]),
+                    "resource_id": random.choice(RESOURCE_MAP[account][anomaly_service]),
+                    "estimated_monthly_savings": round(random.uniform(50, 200), 2),
+                    "details": {
+                        "days_active": random.randint(1, 30),
+                        "savings_pct": random.randint(10, 60)
+                    }
+                }
                 dynamo_manager.put_recommendation(recommendation)
 
         print(" ✓")

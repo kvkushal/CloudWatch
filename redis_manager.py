@@ -38,7 +38,16 @@ _ALERT_LIST_MAX     = 50       # max recent alerts kept in Redis per account
 # Single client with default connection pool (max_connections=10 by default).
 # decode_responses=True so all values come back as str, not bytes.
 
-redis_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
+from config import REDIS_HOST, REDIS_PORT
+from logger import get_logger
+
+logger = get_logger("Redis")
+
+redis_client = redis.Redis(
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    decode_responses=True
+)
 
 
 def check_connection():

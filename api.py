@@ -37,6 +37,10 @@ import dynamo_manager
 import redis_manager
 import anomaly_detector
 import recommendation_engine
+from logger import get_logger
+import time
+
+logger = get_logger("API")
 
 
 # ==================== APP ====================

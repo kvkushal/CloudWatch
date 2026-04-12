@@ -84,10 +84,12 @@ def _save_recommendation(account_id, resource_id, resource_type, rec_type,
         return None
 
     now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+    rec_id = _generate_rec_id()
 
     item = {
         'account_id':               account_id,
-        'rec_id':                   _generate_rec_id(),
+        'rec_id':                   rec_id,
+        'rec_id_timestamp':         f"{rec_id}#{now}",
         'timestamp':                now,
         'resource_id':              resource_id,
         'resource_type':            resource_type,

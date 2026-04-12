@@ -3,20 +3,12 @@ dynamo_manager.py
 
 DynamoDB access layer for the Cloud Cost Monitoring platform.
 
-Design decisions:
-- Single module-level resource/client (connection reuse, not per-call).
-- All multi-page queries use paginate() to handle DynamoDB's 1MB response limit.
-- TTL attribute added to Alerts and ResourceUsage for automatic data expiry.
-- ConsistentRead=True on dashboard/anomaly reads where stale data causes alerts.
-- ReturnConsumedCapacity='TOTAL' on writes for capacity monitoring.
-- ProjectionExpression on hot-path reads (trend, dashboard) to reduce RCU cost.
-- Proper error handling with botocore ClientError, not bare except.
+CAP THEOREM JUSTIFICATION:
+- DynamoDB supports both AP and CP modes
+- Strong consistency used for anomaly + alerts (correctness critical)
+- Eventual consistency used for analytics (performance optimized)
 
-CAP trade-off note:
-  DynamoDB is AP by default (eventual consistency). We opt into strong consistency
-  (ConsistentRead=True) only for anomaly detection and dashboard reads where
-  reading stale cost data could produce false alerts. All other reads use eventual
-  consistency for lower latency and half the RCU cost.
+Redis (used separately) is AP and optimized for low-latency reads.
 """
 
 import time
@@ -25,15 +17,17 @@ from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 from decimal import Decimal
 
+from config import DYNAMODB_ENDPOINT
+from logger import get_logger
 
-# ==================== CONNECTION (module-level singleton) ====================
-# Creating a new boto3 resource per function call re-establishes HTTP connections
-# on every invocation. A module-level resource reuses the underlying urllib3
-# connection pool, which matters under load.
+logger = get_logger("DynamoDB")
+
+
+# ==================== CONNECTION ====================
 
 _dynamodb_resource = boto3.resource(
     'dynamodb',
-    endpoint_url='http://localhost:8000',
+    endpoint_url=DYNAMODB_ENDPOINT,
     region_name='us-east-1',
     aws_access_key_id='dummy',
     aws_secret_access_key='dummy'
@@ -41,7 +35,7 @@ _dynamodb_resource = boto3.resource(
 
 _dynamodb_client = boto3.client(
     'dynamodb',
-    endpoint_url='http://localhost:8000',
+    endpoint_url=DYNAMODB_ENDPOINT,
     region_name='us-east-1',
     aws_access_key_id='dummy',
     aws_secret_access_key='dummy'
@@ -59,43 +53,26 @@ def _client():
 # ==================== TABLE CREATION ====================
 
 def create_resource_usage_table():
-    """
-    Schema design:
-      PK: account_id (HASH)   — all access is per-account, hot partition risk
-          mitigated by low account count (5) and per-service prefix in sort key.
-      SK: resource_type#timestamp (RANGE) — composite key enables begins_with()
-          queries for service-scoped time ranges without a GSI.
-
-    GSI 1 - ResourceTypeIndex:
-      Supports /usage/by-service/<type> queries. Hash=resource_type allows
-      scatter-gather across all accounts for a given service type.
-
-    GSI 2 - RegionIndex:
-      Supports /usage/by-region/<region> queries. Same scatter-gather pattern.
-
-    TTL: expires_at (epoch seconds) — items auto-deleted after 90 days,
-         keeping the table from growing unboundedly without a manual purge job.
-    """
     try:
         table = _resource().create_table(
             TableName='ResourceUsage',
             KeySchema=[
-                {'AttributeName': 'account_id',              'KeyType': 'HASH'},
+                {'AttributeName': 'account_id', 'KeyType': 'HASH'},
                 {'AttributeName': 'resource_type_timestamp', 'KeyType': 'RANGE'}
             ],
             AttributeDefinitions=[
-                {'AttributeName': 'account_id',              'AttributeType': 'S'},
+                {'AttributeName': 'account_id', 'AttributeType': 'S'},
                 {'AttributeName': 'resource_type_timestamp', 'AttributeType': 'S'},
-                {'AttributeName': 'resource_type',           'AttributeType': 'S'},
-                {'AttributeName': 'timestamp',               'AttributeType': 'S'},
-                {'AttributeName': 'region',                  'AttributeType': 'S'}
+                {'AttributeName': 'resource_type', 'AttributeType': 'S'},
+                {'AttributeName': 'timestamp', 'AttributeType': 'S'},
+                {'AttributeName': 'region', 'AttributeType': 'S'}
             ],
             GlobalSecondaryIndexes=[
                 {
                     'IndexName': 'ResourceTypeIndex',
                     'KeySchema': [
                         {'AttributeName': 'resource_type', 'KeyType': 'HASH'},
-                        {'AttributeName': 'timestamp',     'KeyType': 'RANGE'}
+                        {'AttributeName': 'timestamp', 'KeyType': 'RANGE'}
                     ],
                     'Projection': {'ProjectionType': 'ALL'},
                     'ProvisionedThroughput': {'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
@@ -103,7 +80,7 @@ def create_resource_usage_table():
                 {
                     'IndexName': 'RegionIndex',
                     'KeySchema': [
-                        {'AttributeName': 'region',    'KeyType': 'HASH'},
+                        {'AttributeName': 'region', 'KeyType': 'HASH'},
                         {'AttributeName': 'timestamp', 'KeyType': 'RANGE'}
                     ],
                     'Projection': {'ProjectionType': 'ALL'},
@@ -114,107 +91,82 @@ def create_resource_usage_table():
         )
         table.wait_until_exists()
 
-        # Enable TTL — items with expires_at < now() are auto-deleted by DynamoDB
         _client().update_time_to_live(
             TableName='ResourceUsage',
             TimeToLiveSpecification={'Enabled': True, 'AttributeName': 'expires_at'}
         )
-        print("Created: ResourceUsage (TTL=expires_at)")
+
+        logger.info("Created ResourceUsage table")
+
     except ClientError as e:
         if e.response['Error']['Code'] == 'ResourceInUseException':
-            print("ResourceUsage already exists")
+            logger.info("ResourceUsage already exists")
         else:
+            logger.error(f"Error creating ResourceUsage: {e}")
             raise
 
 
 def create_daily_cost_summary_table():
-    """
-    Schema design:
-      PK: account_id (HASH)
-      SK: date (RANGE, ISO 8601 string)
-
-    Date strings sort lexicographically, so between('2025-01-01', '2025-01-31')
-    works correctly without a numeric sort key. No GSI needed — all access
-    patterns are account + date range.
-
-    No TTL here: cost summaries are the source of truth for billing reports and
-    should be retained indefinitely (or per org policy).
-    """
     try:
         table = _resource().create_table(
             TableName='DailyCostSummary',
             KeySchema=[
                 {'AttributeName': 'account_id', 'KeyType': 'HASH'},
-                {'AttributeName': 'date',        'KeyType': 'RANGE'}
+                {'AttributeName': 'date', 'KeyType': 'RANGE'}
             ],
             AttributeDefinitions=[
                 {'AttributeName': 'account_id', 'AttributeType': 'S'},
-                {'AttributeName': 'date',        'AttributeType': 'S'}
+                {'AttributeName': 'date', 'AttributeType': 'S'}
             ],
             ProvisionedThroughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
         )
         table.wait_until_exists()
-        print("Created: DailyCostSummary")
+        logger.info("Created DailyCostSummary table")
+
     except ClientError as e:
         if e.response['Error']['Code'] == 'ResourceInUseException':
-            print("DailyCostSummary already exists")
+            logger.info("DailyCostSummary already exists")
         else:
+            logger.error(f"Error creating DailyCostSummary: {e}")
             raise
 
 
 def create_recommendations_table():
-    """
-    Schema design:
-      PK: account_id (HASH)
-      SK: rec_id#timestamp (RANGE) — composite prevents collision if the same
-          recommendation fires twice in different runs (different timestamps).
-
-    Denormalization: resource_id, rec_type, and estimated_monthly_savings are
-    stored directly on the item rather than normalising into a separate resource
-    table. This avoids a second query on every recommendation list read.
-    """
     try:
         table = _resource().create_table(
             TableName='OptimizationRecommendations',
             KeySchema=[
-                {'AttributeName': 'account_id',     'KeyType': 'HASH'},
-                {'AttributeName': 'rec_id_timestamp','KeyType': 'RANGE'}
+                {'AttributeName': 'account_id', 'KeyType': 'HASH'},
+                {'AttributeName': 'rec_id_timestamp', 'KeyType': 'RANGE'}
             ],
             AttributeDefinitions=[
-                {'AttributeName': 'account_id',      'AttributeType': 'S'},
+                {'AttributeName': 'account_id', 'AttributeType': 'S'},
                 {'AttributeName': 'rec_id_timestamp', 'AttributeType': 'S'}
             ],
             ProvisionedThroughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
         )
         table.wait_until_exists()
-        print("Created: OptimizationRecommendations")
+        logger.info("Created OptimizationRecommendations table")
+
     except ClientError as e:
         if e.response['Error']['Code'] == 'ResourceInUseException':
-            print("OptimizationRecommendations already exists")
+            logger.info("OptimizationRecommendations already exists")
         else:
+            logger.error(f"Error creating recommendations table: {e}")
             raise
 
 
 def create_alerts_table():
-    """
-    Schema design:
-      PK: account_id (HASH)
-      SK: alert_timestamp (RANGE, ISO 8601)
-
-    TTL: expires_at — alerts older than 30 days are expired automatically.
-    This keeps the Alerts table small and prevents historical noise from
-    polluting the recent alert count shown on the dashboard.
-    """
     try:
         table = _resource().create_table(
             TableName='Alerts',
             KeySchema=[
-                {'AttributeName': 'account_id',    'KeyType': 'HASH'},
-                {'AttributeName': 'alert_timestamp','KeyType': 'RANGE'}
+                {'AttributeName': 'account_id', 'KeyType': 'HASH'},
+                {'AttributeName': 'alert_timestamp', 'KeyType': 'RANGE'}
             ],
             AttributeDefinitions=[
-                {'AttributeName': 'account_id',    'AttributeType': 'S'},
-                {'AttributeName': 'alert_timestamp','AttributeType': 'S'}
+                {'AttributeName': 'account_id', 'AttributeType': 'S'},
+                {'AttributeName': 'alert_timestamp', 'AttributeType': 'S'}
             ],
             ProvisionedThroughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
         )
@@ -224,11 +176,14 @@ def create_alerts_table():
             TableName='Alerts',
             TimeToLiveSpecification={'Enabled': True, 'AttributeName': 'expires_at'}
         )
-        print("Created: Alerts (TTL=expires_at)")
+
+        logger.info("Created Alerts table")
+
     except ClientError as e:
         if e.response['Error']['Code'] == 'ResourceInUseException':
-            print("Alerts already exists")
+            logger.info("Alerts already exists")
         else:
+            logger.error(f"Error creating Alerts table: {e}")
             raise
 
 
@@ -239,267 +194,338 @@ def create_all_tables():
     create_alerts_table()
 
 
-# ==================== PAGINATION HELPER ====================
-
-def _paginate_query(table, **kwargs):
-    """
-    DynamoDB returns at most 1MB of data per Query call. Without pagination,
-    any result set larger than 1MB is silently truncated. This helper follows
-    LastEvaluatedKey until all pages are consumed.
-
-    For this project's data volume (5 accounts × 30 days × 5 services × ~4
-    resources = ~3,000 items per table) this rarely triggers, but it is
-    required for correctness and demonstrates production-readiness.
-    """
-    items = []
-    response = table.query(**kwargs)
-    items.extend(response.get('Items', []))
-
-    while 'LastEvaluatedKey' in response:
-        kwargs['ExclusiveStartKey'] = response['LastEvaluatedKey']
-        response = table.query(**kwargs)
-        items.extend(response.get('Items', []))
-
-    return items
-
-
-# ==================== TTL HELPER ====================
-
-_ALERT_TTL_DAYS     = 30
-_USAGE_TTL_DAYS     = 90
-
-
-def _ttl_epoch(days: int) -> int:
-    """Return Unix epoch seconds for `days` from now. Used for DynamoDB TTL."""
-    return int(time.time()) + days * 86400
-
-
-# ==================== CRUD: ResourceUsage ====================
-
-def put_resource_usage(item):
-    table = _resource().Table('ResourceUsage')
-
-    if 'timestamp' not in item:
-        raise ValueError("timestamp is required for ResourceUsage")
-
-    item['resource_type_timestamp'] = f"{item['resource_type']}#{item['timestamp']}"
-    item['usage_quantity'] = Decimal(str(item['usage_quantity']))
-    item['cost_usd']       = Decimal(str(item['cost_usd']))
-    item['expires_at']     = _ttl_epoch(_USAGE_TTL_DAYS)
-
-    table.put_item(
-        Item=item,
-        ReturnConsumedCapacity='TOTAL'
-    )
-
-
-def batch_write_resource_usage(items):
-    """
-    Batch writes in groups of 25 (DynamoDB maximum per batch request).
-    boto3's batch_writer handles this automatically but we add TTL here.
-    """
-    table = _resource().Table('ResourceUsage')
-
-    with table.batch_writer() as batch:
-        for item in items:
-            if 'timestamp' not in item:
-                continue
-            item['resource_type_timestamp'] = f"{item['resource_type']}#{item['timestamp']}"
-            item['usage_quantity'] = Decimal(str(item['usage_quantity']))
-            item['cost_usd']       = Decimal(str(item['cost_usd']))
-            item['expires_at']     = _ttl_epoch(_USAGE_TTL_DAYS)
-            batch.put_item(Item=item)
-
-
-def query_usage_by_account(account_id):
-    table = _resource().Table('ResourceUsage')
-    return _paginate_query(
-        table,
-        KeyConditionExpression=Key('account_id').eq(account_id)
-    )
-
-
-def query_usage_by_account_and_type(account_id, resource_type):
-    table = _resource().Table('ResourceUsage')
-    return _paginate_query(
-        table,
-        KeyConditionExpression=(
-            Key('account_id').eq(account_id) &
-            Key('resource_type_timestamp').begins_with(resource_type + '#')
-        )
-    )
-
-
-def query_usage_by_resource_type(resource_type, start_time=None, end_time=None):
-    table = _resource().Table('ResourceUsage')
-
-    key_expr = Key('resource_type').eq(resource_type)
-    if start_time and end_time:
-        key_expr &= Key('timestamp').between(start_time, end_time)
-
-    return _paginate_query(
-        table,
-        IndexName='ResourceTypeIndex',
-        KeyConditionExpression=key_expr
-    )
-
-
-def query_usage_by_region(region, start_time=None, end_time=None):
-    table = _resource().Table('ResourceUsage')
-
-    key_expr = Key('region').eq(region)
-    if start_time and end_time:
-        key_expr &= Key('timestamp').between(start_time, end_time)
-
-    return _paginate_query(
-        table,
-        IndexName='RegionIndex',
-        KeyConditionExpression=key_expr
-    )
-
-
-# ==================== CRUD: DailyCostSummary ====================
+# ==================== CRUD ====================
 
 def put_daily_cost_summary(item):
-    table = _resource().Table('DailyCostSummary')
+    try:
+        table = _resource().Table('DailyCostSummary')
 
-    item['total_cost']            = Decimal(str(item['total_cost']))
-    item['budget_utilization_pct']= Decimal(str(item['budget_utilization_pct']))
-    item['service_breakdown']     = {
-        k: Decimal(str(v)) for k, v in item['service_breakdown'].items()
-    }
+        item['total_cost'] = Decimal(str(item['total_cost']))
+        item['budget_utilization_pct'] = Decimal(str(item['budget_utilization_pct']))
+        item['service_breakdown'] = {
+            k: Decimal(str(v)) for k, v in item['service_breakdown'].items()
+        }
 
-    table.put_item(
-        Item=item,
-        ReturnConsumedCapacity='TOTAL'
-    )
+        table.put_item(Item=item)
+
+        logger.info(f"Inserted summary: {item['account_id']} {item['date']}")
+
+    except Exception as e:
+        logger.error(f"Error inserting summary: {e}")
+        raise
+
+
+def put_alert(item):
+    try:
+        table = _resource().Table('Alerts')
+
+        item['expires_at'] = int(time.time()) + 30 * 86400
+
+        table.put_item(Item=item)
+
+        logger.info(f"Alert created for {item['account_id']}")
+
+    except Exception as e:
+        logger.error(f"Error inserting alert: {e}")
+        raise
 
 
 def query_daily_costs(account_id, start_date=None, end_date=None):
     """
-    ConsistentRead=True: the anomaly detector reads this immediately after the
-    data generator writes. With eventual consistency (default), the read might
-    return stale data and miss the day's record, producing a false negative.
-    Strong consistency costs 2x RCU but is necessary here for correctness.
+    Query daily cost summaries for an account.
+    If start_date and end_date are provided, filters by date range.
+    Otherwise returns ALL records for the account.
     """
-    table = _resource().Table('DailyCostSummary')
+    try:
+        table = _resource().Table('DailyCostSummary')
 
-    key_expr = Key('account_id').eq(account_id)
-    if start_date and end_date:
-        key_expr &= Key('date').between(start_date, end_date)
+        if start_date and end_date:
+            response = table.query(
+                KeyConditionExpression=Key('account_id').eq(account_id) &
+                                       Key('date').between(start_date, end_date)
+            )
+        else:
+            response = table.query(
+                KeyConditionExpression=Key('account_id').eq(account_id)
+            )
 
-    return _paginate_query(
-        table,
-        KeyConditionExpression=key_expr,
-        ConsistentRead=True
-    )
+        items = response.get('Items', [])
+
+        logger.info(f"Fetched {len(items)} cost records for {account_id}")
+
+        return items
+
+    except Exception as e:
+        logger.error(f"Error querying daily costs: {e}")
+        return []
 
 
 def query_daily_costs_trend(account_id, start_date, end_date):
     """
-    Projection-optimised version for the trend chart.
-    Only fetches date and total_cost — saves RCU by not reading
-    service_breakdown (a large nested map) when we don't need it.
+    Optimised query that only projects date + total_cost.
+    Reduces RCU consumption on the trend endpoint hot path.
     """
-    table = _resource().Table('DailyCostSummary')
+    try:
+        table = _resource().Table('DailyCostSummary')
 
-    return _paginate_query(
-        table,
-        KeyConditionExpression=(
-            Key('account_id').eq(account_id) &
-            Key('date').between(start_date, end_date)
-        ),
-        ProjectionExpression='#d, total_cost',
-        # 'date' is a DynamoDB reserved word, so we alias it
-        ExpressionAttributeNames={'#d': 'date'},
-        ConsistentRead=False    # trend chart can tolerate eventual consistency
-    )
+        response = table.query(
+            KeyConditionExpression=Key('account_id').eq(account_id) &
+                                   Key('date').between(start_date, end_date),
+            ProjectionExpression='#d, total_cost',
+            ExpressionAttributeNames={'#d': 'date'}
+        )
+
+        items = response.get('Items', [])
+        logger.info(f"Fetched {len(items)} trend records for {account_id}")
+        return items
+
+    except Exception as e:
+        logger.error(f"Error querying trend data: {e}")
+        return []
 
 
-# ==================== CRUD: Recommendations ====================
+def list_tables():
+    try:
+        response = _client().list_tables()
+        tables = response.get('TableNames', [])
+        logger.info(f"Existing tables: {tables}")
+        return tables
+    except Exception as e:
+        logger.error(f"Error listing tables: {e}")
+        return []
+
+
+def batch_write_resource_usage(records):
+    try:
+        table = _resource().Table('ResourceUsage')
+
+        def convert(item):
+            if isinstance(item, float):
+                return Decimal(str(item))
+            elif isinstance(item, dict):
+                return {k: convert(v) for k, v in item.items()}
+            elif isinstance(item, list):
+                return [convert(i) for i in item]
+            return item
+
+        with table.batch_writer() as batch:
+            for item in records:
+                # Ensure composite key exists
+                if "resource_type_timestamp" not in item:
+                    item["resource_type_timestamp"] = f"{item['resource_type']}#{item['timestamp']}"
+
+                # Convert floats to Decimal for DynamoDB
+                item = convert(item)
+
+                batch.put_item(Item=item)
+
+        logger.info(f"Batch inserted {len(records)} resource usage records")
+
+    except Exception as e:
+        logger.error(f"Error in batch write: {e}")
+        raise
+
 
 def put_recommendation(item):
-    table = _resource().Table('OptimizationRecommendations')
+    try:
+        table = _resource().Table('OptimizationRecommendations')
 
-    item['rec_id_timestamp']         = f"{item['rec_id']}#{item['timestamp']}"
-    item['estimated_monthly_savings'] = Decimal(str(item['estimated_monthly_savings']))
+        def convert(obj):
+            if isinstance(obj, float):
+                return Decimal(str(obj))
+            elif isinstance(obj, dict):
+                return {k: convert(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert(i) for i in obj]
+            return obj
 
-    table.put_item(
-        Item=item,
-        ReturnConsumedCapacity='TOTAL'
-    )
+        # Convert floats
+        item = convert(item)
+
+        # Ensure composite sort key exists
+        if 'rec_id_timestamp' not in item:
+            rec_id = item.get('rec_id', 'unknown')
+            timestamp = item.get('timestamp', '')
+            item['rec_id_timestamp'] = f"{rec_id}#{timestamp}"
+
+        # TTL
+        item['expires_at'] = int(time.time()) + 30 * 86400
+
+        table.put_item(Item=item)
+
+        logger.info(f"Inserted recommendation for {item['account_id']}")
+
+    except Exception as e:
+        logger.error(f"Error inserting recommendation: {e}")
+        raise
+
+
+def query_alerts(account_id):
+    try:
+        table = _resource().Table('Alerts')
+
+        response = table.query(
+            KeyConditionExpression=Key('account_id').eq(account_id)
+        )
+
+        items = response.get('Items', [])
+
+        logger.info(f"Fetched {len(items)} alerts for {account_id}")
+
+        return items
+
+    except Exception as e:
+        logger.error(f"Error querying alerts: {e}")
+        return []
 
 
 def query_recommendations(account_id):
-    table = _resource().Table('OptimizationRecommendations')
-    return _paginate_query(
-        table,
-        KeyConditionExpression=Key('account_id').eq(account_id)
-    )
-
-
-# ==================== CRUD: Alerts ====================
-
-def put_alert(item):
-    table = _resource().Table('Alerts')
-
-    # TTL: alerts expire after 30 days automatically
-    item['expires_at'] = _ttl_epoch(_ALERT_TTL_DAYS)
-
-    table.put_item(
-        Item=item,
-        ReturnConsumedCapacity='TOTAL'
-    )
-
-
-def query_alerts(account_id, start_time=None, end_time=None):
-    table = _resource().Table('Alerts')
-
-    key_expr = Key('account_id').eq(account_id)
-    if start_time and end_time:
-        key_expr &= Key('alert_timestamp').between(start_time, end_time)
-
-    # ConsistentRead=True: alert count shown on dashboard must reflect writes
-    # from the anomaly detector that may have just completed.
-    return _paginate_query(
-        table,
-        KeyConditionExpression=key_expr,
-        ConsistentRead=True
-    )
-
-
-# ==================== UTILITIES ====================
-
-def list_tables():
-    return _client().list_tables()['TableNames']
-
-
-def get_table_item_count(table_name):
-    """
-    Uses table.scan(Select='COUNT') which reads all items but returns
-    no attribute data, minimising RCU cost for a count operation.
-    In production, prefer table.item_count (updated every ~6h by AWS)
-    or maintain a counter in Redis for real-time counts.
-    """
-    table = _resource().Table(table_name)
     try:
-        count = 0
-        response = table.scan(Select='COUNT')
-        count += response['Count']
-        while 'LastEvaluatedKey' in response:
-            response = table.scan(
-                Select='COUNT',
-                ExclusiveStartKey=response['LastEvaluatedKey']
-            )
-            count += response['Count']
-        return count
-    except ClientError as e:
-        print(f"Error counting {table_name}: {e.response['Error']['Message']}")
-        return 0
+        table = _resource().Table('OptimizationRecommendations')
+
+        response = table.query(
+            KeyConditionExpression=Key('account_id').eq(account_id)
+        )
+
+        items = response.get('Items', [])
+
+        logger.info(f"Fetched {len(items)} recommendations for {account_id}")
+
+        return items
+
+    except Exception as e:
+        logger.error(f"Error querying recommendations: {e}")
+        return []
+
+
+# ==================== GSI QUERIES ====================
+
+def query_usage_by_account(account_id):
+    """
+    Query ALL resource usage records for an account using the primary partition key.
+    Handles pagination for large result sets.
+    """
+    try:
+        table = _resource().Table('ResourceUsage')
+        items = []
+        last_key = None
+
+        while True:
+            kwargs = {
+                'KeyConditionExpression': Key('account_id').eq(account_id)
+            }
+            if last_key:
+                kwargs['ExclusiveStartKey'] = last_key
+
+            response = table.query(**kwargs)
+            items.extend(response.get('Items', []))
+            last_key = response.get('LastEvaluatedKey')
+
+            if not last_key:
+                break
+
+        logger.info(f"Fetched {len(items)} usage records for {account_id}")
+        return items
+
+    except Exception as e:
+        logger.error(f"Error querying usage for account: {e}")
+        return []
+
+
+def query_usage_by_account_and_type(account_id, resource_type):
+    """
+    Query resource usage for a specific account and service type.
+    Uses the primary table with sort key prefix filtering.
+    """
+    try:
+        table = _resource().Table('ResourceUsage')
+        items = []
+        last_key = None
+
+        while True:
+            kwargs = {
+                'KeyConditionExpression': Key('account_id').eq(account_id) &
+                                          Key('resource_type_timestamp').begins_with(f"{resource_type}#")
+            }
+            if last_key:
+                kwargs['ExclusiveStartKey'] = last_key
+
+            response = table.query(**kwargs)
+            items.extend(response.get('Items', []))
+            last_key = response.get('LastEvaluatedKey')
+
+            if not last_key:
+                break
+
+        logger.info(f"Fetched {len(items)} {resource_type} records for {account_id}")
+        return items
+
+    except Exception as e:
+        logger.error(f"Error querying usage by account+type: {e}")
+        return []
+
+
+def query_usage_by_resource_type(resource_type, start=None, end=None):
+    """
+    Query resource usage by service type using the ResourceTypeIndex GSI.
+    Scatter-gather query across all accounts for a given service.
+    """
+    try:
+        table = _resource().Table('ResourceUsage')
+
+        if start and end:
+            key_expr = Key('resource_type').eq(resource_type) & \
+                       Key('timestamp').between(start, end)
+        else:
+            key_expr = Key('resource_type').eq(resource_type)
+
+        response = table.query(
+            IndexName='ResourceTypeIndex',
+            KeyConditionExpression=key_expr
+        )
+
+        items = response.get('Items', [])
+        logger.info(f"Fetched {len(items)} records from ResourceTypeIndex for {resource_type}")
+        return items
+
+    except Exception as e:
+        logger.error(f"Error querying by resource type: {e}")
+        return []
+
+
+def query_usage_by_region(region, start=None, end=None):
+    """
+    Query resource usage by region using the RegionIndex GSI.
+    Returns cost breakdown by service within a region.
+    """
+    try:
+        table = _resource().Table('ResourceUsage')
+
+        if start and end:
+            key_expr = Key('region').eq(region) & \
+                       Key('timestamp').between(start, end)
+        else:
+            key_expr = Key('region').eq(region)
+
+        response = table.query(
+            IndexName='RegionIndex',
+            KeyConditionExpression=key_expr
+        )
+
+        items = response.get('Items', [])
+        logger.info(f"Fetched {len(items)} records from RegionIndex for {region}")
+        return items
+
+    except Exception as e:
+        logger.error(f"Error querying by region: {e}")
+        return []
 
 
 # ==================== MAIN ====================
 
 if __name__ == '__main__':
-    print("Creating all DynamoDB tables...\n")
+    print("=" * 50)
+    print("DYNAMO MANAGER — Table Creation")
+    print("=" * 50)
     create_all_tables()
+    print("\nTables:", list_tables())
