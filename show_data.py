@@ -148,3 +148,42 @@ else:
 print("\n" + "═" * W)
 print("  All database checks complete.")
 print("═" * W + "\n")
+
+
+# ══════════════ PERFORMANCE ══════════════
+
+box("PERFORMANCE — Redis Cache vs DynamoDB Direct")
+import time
+
+# Redis read
+t1 = time.time()
+for _ in range(10):
+    redis_manager.get_dashboard_snapshot('acct-001')
+redis_avg = ((time.time() - t1) / 10) * 1000
+
+# DynamoDB read
+t2 = time.time()
+for _ in range(10):
+    dynamo_manager.query_daily_costs('acct-001')
+dynamo_avg = ((time.time() - t2) / 10) * 1000
+
+speedup = dynamo_avg / redis_avg if redis_avg > 0 else 0
+
+print(f"  {'Source':<30} {'Avg Latency':<15} {'Pattern'}")
+print(f"  {'─' * 60}")
+print(f"  {'Redis HASH (dashboard)':<30} {redis_avg:<15.2f} Cache hit")
+print(f"  {'DynamoDB Query (costs)':<30} {dynamo_avg:<15.2f} Direct read")
+print(f"  {'Speedup':<30} {speedup:.1f}x faster")
+print(f"\n  Cache-aside pattern: Check Redis → miss → DynamoDB → populate Redis")
+
+
+box("CAP THEOREM — Active Configuration")
+print(f"  {'Component':<25} {'Mode':<8} {'Justification'}")
+print(f"  {'─' * 60}")
+print(f"  {'DynamoDB (anomaly)':<25} {'CP':<8} Strong reads for correctness")
+print(f"  {'DynamoDB (analytics)':<25} {'AP':<8} Eventual reads save RCU")
+print(f"  {'Redis (cache layer)':<25} {'AP':<8} TTL-based self-healing")
+
+print("\n" + "═" * W)
+print("  Complete.")
+print("═" * W + "\n")

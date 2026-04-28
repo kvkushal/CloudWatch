@@ -980,7 +980,7 @@ st.markdown('<div class="panel">', unsafe_allow_html=True)
 st.markdown("""
 <div class="section-header">
     <div class="section-title">Query Explorer</div>
-    <div class="section-badge">Live API Queries</div>
+    <div class="section-badge">Database Queries</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -999,124 +999,180 @@ query_type = st.selectbox(
 # ---- Helper to show table ----
 def show_table(result):
     if "data" not in result or not result["data"]:
+        st.info("No data returned for this query.")
         return
 
     data = result["data"]
 
-    # Case 1: list of records (most queries)
     if isinstance(data, list):
         df = pd.DataFrame(data)
-
-    # Case 2: single dict (anomaly, stats, etc.)
     elif isinstance(data, dict):
         df = pd.DataFrame([data])
-
     else:
         return
 
-    # Only select columns if they exist
-    cols = [c for c in ["account_id", "resource_type", "region", "cost_usd", "usage_quantity"] if c in df.columns]
-    if cols:
-        df = df[cols]
+    st.dataframe(df, use_container_width=True)
 
-    st.dataframe(df.head(10), use_container_width=True)
+
+def run_query(endpoint, demo_fallback_fn=None):
+    """Try live API first, fall back to demo data if unavailable."""
+    if DEMO_MODE and demo_fallback_fn:
+        result = demo_fallback_fn()
+        st.markdown('<div class="section-badge">Source: demo_data (local)</div>', unsafe_allow_html=True)
+        return result
+
+    result = safe_fetch(endpoint, {"error": "API unavailable"})
+    if "error" in result:
+        if demo_fallback_fn:
+            result = demo_fallback_fn()
+            st.markdown('<div class="section-badge">Source: demo_data (API offline)</div>', unsafe_allow_html=True)
+            return result
+        st.warning("No data returned. Ensure the Flask API is running (python api.py).")
+        return None
+    st.markdown(f'<div class="section-badge">Source: {result.get("source", "dynamodb")}</div>', unsafe_allow_html=True)
+    return result
 
 
 # ---- Cost Query ----
 if query_type == "Cost by Date Range":
+    st.markdown('<div style="font-size:11px;color:#4A5568;font-family:JetBrains Mono,monospace;margin-bottom:10px">'
+                'DynamoDB Query: Key(account_id).eq(acct) &amp; Key(date).between(start, end)<br>'
+                'Table: DailyCostSummary | PK: account_id | SK: date</div>', unsafe_allow_html=True)
     start = st.date_input("Start Date")
     end   = st.date_input("End Date")
 
     if st.button("Run Cost Query"):
-        result = safe_fetch(f"/costs/{selected_account}?start={start}&end={end}", {"error": "No data"})
-
-        if "error" in result:
-            st.markdown('<div class="section-badge">Source: unavailable</div>', unsafe_allow_html=True)
-            st.warning("No data returned")
-        else:
-            st.markdown(f'<div class="section-badge">Source: {result.get("source", "unknown")}</div>', unsafe_allow_html=True)
+        def _demo():
+            return demo_data.get_costs(selected_account)
+        result = run_query(f"/costs/{selected_account}?start={start}&end={end}", _demo)
+        if result:
             show_table(result)
-            st.json(result)
-
+            with st.expander("Raw JSON Response"):
+                st.json(result)
 
 # ---- Service Query ----
 elif query_type == "Usage by Service":
+    st.markdown('<div style="font-size:11px;color:#4A5568;font-family:JetBrains Mono,monospace;margin-bottom:10px">'
+                'DynamoDB GSI Query: IndexName=ResourceTypeIndex<br>'
+                'Key(resource_type).eq(service) | Scatter-gather across accounts</div>', unsafe_allow_html=True)
     service = st.selectbox("Service", ["EC2", "S3", "Lambda", "RDS", "CloudFront"])
 
     if st.button("Run Service Query"):
-        result = safe_fetch(f"/usage/by-service/{service}", {"error": "No data"})
-
-        if "error" in result:
-            st.markdown('<div class="section-badge">Source: unavailable</div>', unsafe_allow_html=True)
-            st.warning("No data returned")
-        else:
-            st.markdown(f'<div class="section-badge">Source: {result.get("source", "unknown")}</div>', unsafe_allow_html=True)
+        def _demo():
+            import random
+            rng = random.Random(42)
+            records = []
+            for acct in ACCOUNTS:
+                for _ in range(5):
+                    records.append({
+                        "account_id": acct, "resource_type": service,
+                        "resource_id": f"{'i' if service=='EC2' else 'r'}-{rng.randint(1000,9999):x}",
+                        "region": rng.choice(["us-east-1", "ap-south-1", "eu-west-1"]),
+                        "cost_usd": round(rng.uniform(1, 50), 4),
+                        "usage_quantity": round(rng.uniform(5, 100), 2),
+                    })
+            return {"data": records, "source": "demo_data"}
+        result = run_query(f"/usage/by-service/{service}", _demo)
+        if result:
             show_table(result)
-            st.json(result)
-
+            with st.expander("Raw JSON Response"):
+                st.json(result)
 
 # ---- Region Query ----
 elif query_type == "Usage by Region":
-    region = st.selectbox("Region", ["ap-south-1", "us-east-1", "eu-west-1"])
+    st.markdown('<div style="font-size:11px;color:#4A5568;font-family:JetBrains Mono,monospace;margin-bottom:10px">'
+                'DynamoDB GSI Query: IndexName=RegionIndex<br>'
+                'Key(region).eq(region) | Regional cost breakdown</div>', unsafe_allow_html=True)
+    region_sel = st.selectbox("Region", ["ap-south-1", "us-east-1", "eu-west-1"])
 
     if st.button("Run Region Query"):
-        result = safe_fetch(f"/usage/by-region/{region}", {"error": "No data"})
-
-        if "error" in result:
-            st.markdown('<div class="section-badge">Source: unavailable</div>', unsafe_allow_html=True)
-            st.warning("No data returned")
-        else:
-            st.markdown(f'<div class="section-badge">Source: {result.get("source", "unknown")}</div>', unsafe_allow_html=True)
+        def _demo():
+            import random
+            rng = random.Random(43)
+            records = []
+            for acct in ACCOUNTS:
+                for svc in ["EC2", "S3", "Lambda", "RDS", "CloudFront"]:
+                    records.append({
+                        "account_id": acct, "resource_type": svc,
+                        "region": region_sel,
+                        "cost_usd": round(rng.uniform(5, 80), 2),
+                        "usage_quantity": round(rng.uniform(10, 200), 2),
+                    })
+            svc_costs = {}
+            for r in records:
+                svc_costs[r["resource_type"]] = svc_costs.get(r["resource_type"], 0) + r["cost_usd"]
+            return {"data": records, "service_cost_summary": {k: round(v,2) for k,v in svc_costs.items()}, "source": "demo_data"}
+        result = run_query(f"/usage/by-region/{region_sel}", _demo)
+        if result:
             show_table(result)
-            st.json(result)
-
+            with st.expander("Raw JSON Response"):
+                st.json(result)
 
 # ---- Rankings ----
 elif query_type == "Top Accounts (Ranking)":
+    st.markdown('<div style="font-size:11px;color:#4A5568;font-family:JetBrains Mono,monospace;margin-bottom:10px">'
+                'Redis Command: ZREVRANGE cost_rank:{date} 0 9 WITHSCORES<br>'
+                'Structure: Sorted Set (ZSET) — O(log N) ranked retrieval</div>', unsafe_allow_html=True)
+
     if st.button("Run Ranking Query"):
-        result = safe_fetch("/rankings", {"error": "No data"})
-
-        if "error" in result:
-            st.markdown('<div class="section-badge">Source: unavailable</div>', unsafe_allow_html=True)
-            st.warning("No data returned")
-        else:
-            st.markdown(f'<div class="section-badge">Source: {result.get("source", "unknown")}</div>', unsafe_allow_html=True)
+        def _demo():
+            import random
+            rng = random.Random(44)
+            data = [{"account_id": a, "total_cost": round(rng.uniform(20, 60), 2)} for a in ACCOUNTS]
+            data.sort(key=lambda x: -x["total_cost"])
+            return {"data": data, "source": "demo_data (Redis ZSET)"}
+        result = run_query("/rankings", _demo)
+        if result:
             show_table(result)
-            st.json(result)
-
+            with st.expander("Raw JSON Response"):
+                st.json(result)
 
 # ---- Anomaly ----
 elif query_type == "Anomaly Stats":
+    st.markdown('<div style="font-size:11px;color:#4A5568;font-family:JetBrains Mono,monospace;margin-bottom:10px">'
+                'Redis Command: HGETALL anomaly:{account_id}<br>'
+                'Structure: HASH — stores mean, std_dev, count for z-score model</div>', unsafe_allow_html=True)
+
     if st.button("Run Anomaly Query"):
-        result = safe_fetch(f"/anomaly-stats/{selected_account}", {"error": "No data"})
-
-        if "error" in result:
-            st.markdown('<div class="section-badge">Source: unavailable</div>', unsafe_allow_html=True)
-            st.warning("No data returned")
-        else:
-            st.markdown(f'<div class="section-badge">Source: {result.get("source", "unknown")}</div>', unsafe_allow_html=True)
-
-            # Handle anomaly data properly
-            if "data" in result and isinstance(result["data"], dict) and result["data"]:
-                st.subheader("Anomaly Summary")
-                st.json(result["data"])
-            else:
-                show_table(result)
-
-            st.json(result)
-
+        def _demo():
+            return demo_data.get_anomaly_stats(selected_account)
+        result = run_query(f"/anomaly-stats/{selected_account}", _demo)
+        if result:
+            anom_data = result.get("data", {})
+            if isinstance(anom_data, dict) and anom_data:
+                mean_val = float(anom_data.get("mean", 0))
+                std_val = float(anom_data.get("std_dev", 0))
+                count_val = int(anom_data.get("count", 0))
+                threshold = mean_val + 2 * std_val
+                cv = (std_val / mean_val * 100) if mean_val else 0
+                summary_df = pd.DataFrame([{
+                    "Metric": "Mean Daily Cost", "Value": f"${mean_val:.2f}",
+                }, {
+                    "Metric": "Std Deviation", "Value": f"${std_val:.2f}",
+                }, {
+                    "Metric": "Data Points", "Value": str(count_val),
+                }, {
+                    "Metric": "Anomaly Threshold (2σ)", "Value": f"${threshold:.2f}",
+                }, {
+                    "Metric": "Coefficient of Variation", "Value": f"{cv:.1f}%",
+                }])
+                st.dataframe(summary_df, use_container_width=True, hide_index=True)
+            with st.expander("Raw JSON Response"):
+                st.json(result)
 
 # ---- Recommendations ----
 elif query_type == "Recommendations":
-    if st.button("Run Recommendation Query"):
-        result = safe_fetch(f"/recommendations/{selected_account}", {"error": "No data"})
+    st.markdown('<div style="font-size:11px;color:#4A5568;font-family:JetBrains Mono,monospace;margin-bottom:10px">'
+                'DynamoDB Query: Key(account_id).eq(acct)<br>'
+                'Table: OptimizationRecommendations | PK: account_id | SK: rec_id_timestamp</div>', unsafe_allow_html=True)
 
-        if "error" in result:
-            st.markdown('<div class="section-badge">Source: unavailable</div>', unsafe_allow_html=True)
-            st.warning("No data returned")
-        else:
-            st.markdown(f'<div class="section-badge">Source: {result.get("source", "unknown")}</div>', unsafe_allow_html=True)
+    if st.button("Run Recommendation Query"):
+        def _demo():
+            return demo_data.get_recommendations(selected_account)
+        result = run_query(f"/recommendations/{selected_account}", _demo)
+        if result:
             show_table(result)
-            st.json(result)
+            with st.expander("Raw JSON Response"):
+                st.json(result)
 
 st.markdown('</div>', unsafe_allow_html=True)
