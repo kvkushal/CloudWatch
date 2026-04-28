@@ -124,9 +124,17 @@ assert avg_ms < 500, f'Latency too high: {avg_ms:.2f}ms'
                     docker inspect cloudwatch-app:latest --format='{{.Size}}'
                 '''
 
+                // Stop any standalone containers using our ports
+                sh '''
+                    echo "Stopping standalone containers..."
+                    docker stop dynamodb-local redis-local 2>/dev/null || true
+                    docker rm dynamodb-local redis-local 2>/dev/null || true
+                    docker-compose down 2>/dev/null || true
+                    echo "Ports cleared ✓"
+                '''
+
                 // Deploy using docker-compose
                 sh '''
-                    docker-compose down || true
                     docker-compose up -d
                     echo "Containers started ✓"
                 '''
