@@ -19,7 +19,7 @@ if DEMO_MODE:
     import demo_data
 
 st.set_page_config(
-    page_title="loudWatch - Cost Intelligence",
+    page_title="CloudWatch - Cost Intelligence",
     layout="wide",
     initial_sidebar_state="expanded"
 )
